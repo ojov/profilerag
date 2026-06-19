@@ -1,10 +1,11 @@
+import gradio as gr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from rag import client, collection, index_profile, rewrite_query, EMBED_MODEL, CHAT_MODEL
+from app import demo
 
-# ── APP SETUP ─────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -68,3 +69,7 @@ Context:
 @app.on_event("startup")
 def startup_event():
     index_profile()
+
+
+# ── MOUNT GRADIO UI AT ROOT ───────────────────────────────────
+app = gr.mount_gradio_app(app, demo, path="/")
