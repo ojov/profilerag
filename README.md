@@ -1,22 +1,26 @@
 # Portfolio RAG Chatbot
 
-A minimal RAG (Retrieval-Augmented Generation) chatbot that answers questions about you, built from a single markdown profile. Uses FastAPI, ChromaDB, and the OpenAI API — no LangChain, no LlamaIndex, just the raw pipeline so every step is visible.
+A minimal RAG (Retrieval-Augmented Generation) chatbot that answers questions about you, built from a single markdown profile. Uses FastAPI, ChromaDB, Gradio, and the OpenAI API — no LangChain, no LlamaIndex, just the raw pipeline so every step is visible.
 
 ## How it works
 
-Two pipelines:
+Three pipelines:
 
 **Indexing (runs once, on startup)**
 `profile.md` → chunked by heading → embedded → stored in ChromaDB
 
+**Query rewriting (runs on every follow-up)**
+conversation history + new question → LLM rewrites into a standalone search query
+(without this, "tell me more about that" retrieves garbage from the vector store)
+
 **Querying (runs on every request)**
-user question → embedded → top-3 chunks retrieved → injected into prompt → LLM generates grounded answer
+rewritten query → embedded → top-3 chunks retrieved → injected into prompt → LLM generates grounded answer
 
 ---
 
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.13+
 - [uv](https://docs.astral.sh/uv/) — fast Python package/project manager
 - An OpenAI API key ([platform.openai.com/api-keys](https://platform.openai.com/api-keys))
 
@@ -45,7 +49,7 @@ This creates `pyproject.toml` and a stub `main.py`.
 Add dependencies — `uv` creates a `.venv` and installs everything:
 
 ```bash
-uv add fastapi uvicorn chromadb openai python-dotenv
+uv add fastapi uvicorn chromadb openai python-dotenv gradio httpx
 ```
 
 From now on, run any Python command with `uv run` (no manual venv activation needed):
@@ -107,19 +111,17 @@ The richer and more specific this file is, the better the chatbot's answers will
 
 ## 3. Build the RAG pipeline — `rag.py`
 
-This file holds chunking, embedding, and indexing logic — kept separate from the FastAPI app so it's reusable and easier to read.
+This file holds chunking, embedding, indexing, and query-rewriting logic — kept separate from the FastAPI app so it's reusable and easier to read.
 
 ```python
-import os
 import re
-
 from openai import OpenAI
 import chromadb
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(timeout=30.0, max_retries=3)  # reads OPENAI_API_KEY from environment
+client = OpenAI(timeout=30.0, max_retries=3)
 chroma = chromadb.Client()
 collection = chroma.get_or_create_collection("portfolio")
 
@@ -127,17 +129,8 @@ EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 
 
-# ── 1. CHUNKING ──────────────────────────────────────────────
 def chunk_markdown(path: str, chunk_size: int = 250) -> list[str]:
-    """
-    Split a markdown file into chunks.
-    Strategy: split on top-level headings first (so each section
-    stays together), then further split long sections by word count.
-    """
     text = open(path, encoding="utf-8").read()
-
-    # Split on lines starting with '#' (headings), keeping the heading
-    # attached to its section
     sections = re.split(r"\n(?=#{1,3}\s)", text)
 
     chunks = []
@@ -149,35 +142,54 @@ def chunk_markdown(path: str, chunk_size: int = 250) -> list[str]:
         if len(words) <= chunk_size:
             chunks.append(section)
         else:
-            # Section too long — split further by word count
             for i in range(0, len(words), chunk_size):
                 chunks.append(" ".join(words[i:i + chunk_size]))
 
     return chunks
 
 
-# ── 2. EMBED & INDEX ─────────────────────────────────────────
 def index_profile(path: str = "profile.md"):
     chunks = chunk_markdown(path)
-
-    response = client.embeddings.create(
-        input=chunks,
-        model=EMBED_MODEL
-    )
+    response = client.embeddings.create(input=chunks, model=EMBED_MODEL)
     embeddings = [item.embedding for item in response.data]
-
     collection.add(
         ids=[str(i) for i in range(len(chunks))],
         documents=chunks,
-        embeddings=embeddings
+        embeddings=embeddings,
     )
     print(f"Indexed {len(chunks)} chunks into ChromaDB.")
 
 
+def rewrite_query(question: str, history: list[dict]) -> str:
+    """
+    Rewrite a follow-up question into a standalone search query.
+    Without this, vague questions like "tell me more about that" embed
+    poorly and return irrelevant chunks from the vector store.
+    """
+    if not history:
+        return question
+
+    history_text = "\n".join(f"{m['role']}: {m['content']}" for m in history)
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": f"""Given this conversation history:
+{history_text}
+
+Rewrite the user's latest question into a short, standalone search query
+that makes sense without the conversation history. Reply with ONLY the
+rewritten query, nothing else.""",
+            },
+            {"role": "user", "content": question},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
 if __name__ == "__main__":
     index_profile()
-
-    # Sanity check: pull everything back out
     results = collection.get()
     print(f"\nCollection now has {len(results['ids'])} documents.")
     print("First document preview:", results["documents"][0][:100])
@@ -197,20 +209,66 @@ Collection now has 9 documents.
 First document preview: # About Me ...
 ```
 
-This confirms two things independently: that your markdown is being split sensibly, and that OpenAI's embedding API is reachable and returning vectors.
+---
+
+## 4. Build the Gradio UI — `app.py`
+
+This file defines the chat interface. It calls the `/chat` FastAPI endpoint and converts Gradio's tuple history format into the OpenAI message list format.
+
+```python
+import httpx
+import gradio as gr
+
+CHAT_ENDPOINT = "http://localhost:8000/chat"
+
+
+def chat_fn(message: str, history: list) -> str:
+    openai_history = []
+    for user_msg, assistant_msg in history:
+        openai_history.append({"role": "user", "content": user_msg})
+        if assistant_msg:
+            openai_history.append({"role": "assistant", "content": assistant_msg})
+
+    response = httpx.post(
+        CHAT_ENDPOINT,
+        json={"message": message, "history": openai_history},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return response.json()["reply"]
+
+
+with gr.Blocks(title="Portfolio Intelligence") as demo:
+    gr.ChatInterface(
+        fn=chat_fn,
+        examples=[
+            "What are your main technical skills?",
+            "Tell me about your projects.",
+            "What is your work experience?",
+        ],
+        cache_examples=False,
+    )
+
+
+if __name__ == "__main__":
+    demo.launch()
+```
 
 ---
 
-## 4. Build the API — `main.py`
+## 5. Build the API — `main.py`
+
+This file wires together the FastAPI backend and the Gradio UI. The Gradio app is mounted at `/` so visiting the server in a browser opens the chat interface directly.
 
 ```python
+import gradio as gr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from rag import client, collection, index_profile, EMBED_MODEL, CHAT_MODEL
+from rag import client, collection, index_profile, rewrite_query, EMBED_MODEL, CHAT_MODEL
+from app import demo
 
-# ── APP SETUP ─────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -222,49 +280,45 @@ app.add_middleware(
 
 class Query(BaseModel):
     message: str
+    history: list[dict] = []  # [{"role": "user"/"assistant", "content": "..."}]
 
 
-# ── QUERY ENDPOINT ───────────────────────────────────────────
 @app.post("/chat")
 def chat(query: Query):
-    # Embed the incoming question
-    q_response = client.embeddings.create(
-        input=[query.message],
-        model=EMBED_MODEL
-    )
+    # Rewrite follow-up questions into standalone queries for retrieval
+    search_query = rewrite_query(query.message, query.history)
+
+    q_response = client.embeddings.create(input=[search_query], model=EMBED_MODEL)
     q_embedding = q_response.data[0].embedding
 
-    # Retrieve top 3 most relevant chunks
-    results = collection.query(
-        query_embeddings=[q_embedding],
-        n_results=3
-    )
+    results = collection.query(query_embeddings=[q_embedding], n_results=3)
     context = "\n\n".join(results["documents"][0])
 
-    # Generate a grounded response
-    completion = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": f"""You are a helpful assistant representing this person's portfolio.
+    messages = [
+        {
+            "role": "system",
+            "content": f"""You are a helpful assistant representing this person's portfolio.
 Answer questions about them using only the context below. Be conversational and friendly.
 If the answer isn't in the context, say you don't have that information.
 
 Context:
-{context}"""
-            },
-            {"role": "user", "content": query.message}
-        ]
-    )
+{context}""",
+        }
+    ]
+    messages.extend(query.history)
+    messages.append({"role": "user", "content": query.message})
 
+    completion = client.chat.completions.create(model=CHAT_MODEL, messages=messages)
     return {"reply": completion.choices[0].message.content}
 
 
-# ── INDEX ON STARTUP ─────────────────────────────────────────
 @app.on_event("startup")
 def startup_event():
     index_profile()
+
+
+# Mount Gradio at the root so the chat UI is the landing page
+app = gr.mount_gradio_app(app, demo, path="/")
 ```
 
 ### Run it
@@ -280,23 +334,34 @@ Indexed 9 chunks into ChromaDB.
 INFO:     Application startup complete.
 ```
 
-### Test it
+### Use it
 
-Open the auto-generated Swagger UI:
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) — the Gradio chat UI loads directly.
+
+The raw API is also available. To test via Swagger UI:
 
 ```
 http://127.0.0.1:8000/docs
 ```
 
-Click **POST /chat → Try it out**, enter:
-
+Example request:
 ```json
 {
-  "message": "What projects has this person worked on?"
+  "message": "What projects has this person worked on?",
+  "history": []
 }
 ```
 
-Click **Execute** — you should get back a generated answer grounded in your `profile.md`.
+For a follow-up with history:
+```json
+{
+  "message": "Tell me more about that.",
+  "history": [
+    {"role": "user", "content": "What projects has this person worked on?"},
+    {"role": "assistant", "content": "They worked on..."}
+  ]
+}
+```
 
 ---
 
@@ -305,11 +370,12 @@ Click **Execute** — you should get back a generated answer grounded in your `p
 ```
 portfolio-rag/
 ├── profile.md          # your knowledge base
-├── rag.py              # chunking, embedding, indexing
-├── main.py             # FastAPI app + /chat endpoint
-├── pyproject.toml       # uv-managed dependencies
+├── rag.py              # chunking, embedding, indexing, query rewriting
+├── app.py              # Gradio chat UI
+├── main.py             # FastAPI app + /chat endpoint + Gradio mount
+├── pyproject.toml      # uv-managed dependencies
 ├── uv.lock
-├── .env                 # OPENAI_API_KEY (gitignored)
+├── .env                # OPENAI_API_KEY (gitignored)
 └── .gitignore
 ```
 
@@ -326,27 +392,27 @@ If `curl` succeeds but Python still fails, update the client libraries:
 ```bash
 uv add --upgrade openai httpx
 ```
-Also add explicit timeout/retry settings to the client in `rag.py` (already included above):
-```python
-client = OpenAI(timeout=30.0, max_retries=3)
-```
+The client in `rag.py` already has explicit timeout/retry settings (`timeout=30.0, max_retries=3`), which helps on flaky connections.
 
 **Auth errors on startup**
 Make sure `.env` is in the same directory you're running `uv run` from, and that `load_dotenv()` runs before `OpenAI()` is instantiated.
+
+**Gradio UI not loading at `/`**
+The `gr.mount_gradio_app(app, demo, path="/")` call must happen *after* all FastAPI routes are defined (it reassigns `app`). Keep it as the last line in `main.py`.
 
 ---
 
 ## Notes & limitations
 
-- **No memory.** Each `/chat` call is stateless — the bot has no record of earlier messages in the conversation. Adding memory means passing conversation history from the client with each request (see "What's next" below).
-- **In-memory vector store.** ChromaDB's default client keeps everything in RAM. Restarting the server re-indexes `profile.md` from scratch (cheap — a few cents in embedding calls — but not instant).
+- **In-memory vector store.** ChromaDB's default client keeps everything in RAM. Restarting the server re-indexes `profile.md` from scratch (a few cents in embedding calls, but not instant).
 - **Single document.** This indexes one markdown file. Scaling to multiple documents just means looping `chunk_markdown` over a folder.
+- **No streaming.** Responses arrive all at once. Adding `stream=True` to the completions call and returning a `StreamingResponse` from FastAPI would give a typing effect.
 
 ## What's next
 
-- Add conversation memory (pass `history` from the frontend)
 - Index multiple files (CV, blog posts, project READMEs)
 - Add metadata filtering (tag chunks by topic, filter at query time)
-- Stream responses (`stream=True`) for a typing effect
-- Deploy to Railway and connect to a real portfolio site
-- Trigger re-indexing from an n8n workflow when `profile.md` changes
+- Stream responses (`stream=True`) for a typing effect in the UI
+- Persist the ChromaDB collection to disk so re-indexing isn't needed on every restart
+- Deploy to Railway or Render and connect to a real portfolio site
+- Trigger re-indexing from a webhook or n8n workflow when `profile.md` changes
