@@ -6,6 +6,7 @@ import chromadb
 from dotenv import load_dotenv
 
 load_dotenv()
+
 client = OpenAI(timeout=30.0, max_retries=3)  # reads OPENAI_API_KEY from environment
 chroma = chromadb.Client()
 collection = chroma.get_or_create_collection("portfolio")
@@ -59,6 +60,37 @@ def index_profile(path: str = "profile.md"):
         embeddings=embeddings
     )
     print(f"Indexed {len(chunks)} chunks into ChromaDB.")
+
+
+# ── 3. QUERY REWRITING (for follow-up questions) ─────────────
+def rewrite_query(question: str, history: list[dict]) -> str:
+    """
+    If there's conversation history, rewrite the question into a
+    standalone query that makes sense without the prior context.
+    This matters because retrieval embeds ONLY the rewritten query —
+    without this step, "tell me more about that" retrieves garbage.
+    """
+    if not history:
+        return question
+
+    history_text = "\n".join(f"{m['role']}: {m['content']}" for m in history)
+
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": f"""Given this conversation history:
+{history_text}
+
+Rewrite the user's latest question into a short, standalone search query
+that makes sense without the conversation history. Reply with ONLY the
+rewritten query, nothing else."""
+            },
+            {"role": "user", "content": question}
+        ]
+    )
+    return response.choices[0].message.content.strip()
 
 
 if __name__ == "__main__":

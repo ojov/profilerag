@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from rag import client, collection, index_profile, EMBED_MODEL, CHAT_MODEL
+from rag import client, collection, index_profile, rewrite_query, EMBED_MODEL, CHAT_MODEL
 
 # ── APP SETUP ─────────────────────────────────────────────────
 app = FastAPI()
@@ -16,14 +16,20 @@ app.add_middleware(
 
 class Query(BaseModel):
     message: str
+    history: list[dict] = []  # [{"role": "user"/"assistant", "content": "..."}]
 
 
 # ── QUERY ENDPOINT ───────────────────────────────────────────
 @app.post("/chat")
 def chat(query: Query):
-    # Embed the incoming question
+    # Rewrite the question into a standalone query for retrieval.
+    # Without this, a follow-up like "tell me more about that" would be
+    # embedded as-is and retrieve irrelevant chunks.
+    search_query = rewrite_query(query.message, query.history)
+
+    # Embed the rewritten query (not the raw message)
     q_response = client.embeddings.create(
-        input=[query.message],
+        input=[search_query],
         model=EMBED_MODEL
     )
     q_embedding = q_response.data[0].embedding
@@ -35,21 +41,24 @@ def chat(query: Query):
     )
     context = "\n\n".join(results["documents"][0])
 
-    # Generate a grounded response
-    completion = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": f"""You are a helpful assistant representing this person's portfolio.
+    # Build the full message list: system prompt + history + new question
+    messages = [
+        {
+            "role": "system",
+            "content": f"""You are a helpful assistant representing this person's portfolio.
 Answer questions about them using only the context below. Be conversational and friendly.
 If the answer isn't in the context, say you don't have that information.
 
 Context:
 {context}"""
-            },
-            {"role": "user", "content": query.message}
-        ]
+        }
+    ]
+    messages.extend(query.history)
+    messages.append({"role": "user", "content": query.message})
+
+    completion = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages
     )
 
     return {"reply": completion.choices[0].message.content}
